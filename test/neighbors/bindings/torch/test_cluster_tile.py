@@ -15,10 +15,19 @@
 
 """Tests for the single-system cluster-pair tile neighbor list PyTorch bindings."""
 
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+
 import pytest
 import torch
 
-from nvalchemiops.neighbors.neighbor_utils import NeighborOverflowError
+from nvalchemiops.neighbors.neighbor_utils import (
+    NeighborOverflowError,
+    TileBufferOverflow,
+)
 from nvalchemiops.torch.neighbors.cell_list import cell_list
 from nvalchemiops.torch.neighbors.cluster_tile import (
     TILE_GROUP_SIZE,
@@ -59,6 +68,87 @@ def _orthorhombic_cell(
     cell_size: float, device: str, dtype=torch.float32
 ) -> torch.Tensor:
     return (torch.eye(3, dtype=dtype, device=device) * cell_size).reshape(1, 3, 3)
+
+
+def _run_isolated_fullgraph_overflow(kind: str) -> subprocess.CompletedProcess[str]:
+    """Run one invalid fullgraph call in a fresh process and cache."""
+    script = textwrap.dedent(
+        f"""
+        import torch
+        from nvalchemiops.torch.neighbors.cluster_tile import cluster_tile_neighbor_list
+
+        positions = torch.zeros((64, 3), dtype=torch.float32, device="cuda")
+        cell = torch.eye(3, dtype=torch.float32, device="cuda").reshape(1, 3, 3) * 6.0
+
+        if {kind!r} == "compact_tile":
+            @torch.compile(fullgraph=True)
+            def run(values):
+                return cluster_tile_neighbor_list(
+                    values, 2.0, cell, format="tile", max_neighbors=64,
+                    max_tiles_per_group=1,
+                )
+            run(positions)
+        elif {kind!r} == "prepared_matrix":
+            num_tiles, tile_row_group, tile_col_group, *_ = cluster_tile_neighbor_list(
+                positions, 2.0, cell, format="tile",
+            )
+            neighbor_matrix = torch.empty((64, 1), dtype=torch.int32, device="cuda")
+            num_neighbors = torch.zeros(64, dtype=torch.int32, device="cuda")
+            neighbor_shifts = torch.empty((64, 1, 3), dtype=torch.int32, device="cuda")
+
+            @torch.compile(fullgraph=True)
+            def run(values):
+                return cluster_tile_neighbor_list(
+                    values, 2.0, cell, max_neighbors=1,
+                    max_tiles_per_group=16,
+                    neighbor_matrix=neighbor_matrix,
+                    num_neighbors=num_neighbors,
+                    neighbor_matrix_shifts=neighbor_shifts,
+                    num_tiles=num_tiles,
+                    tile_row_group=tile_row_group,
+                    tile_col_group=tile_col_group,
+                )
+            run(positions)
+        else:
+            num_tiles, tile_row_group, tile_col_group, *_ = cluster_tile_neighbor_list(
+                positions, 2.0, cell, format="tile",
+            )
+            capacity = 64
+            neighbor_list = torch.empty((2, capacity), dtype=torch.int32, device="cuda")
+            neighbor_shifts = torch.empty((capacity, 3), dtype=torch.int32, device="cuda")
+            pair_offsets = torch.tensor([0, capacity], dtype=torch.int32, device="cuda")
+            pair_counts = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+            @torch.compile(fullgraph=True)
+            def run(values):
+                return cluster_tile_neighbor_list(
+                    values, 2.0, cell, max_neighbors=64, format="coo",
+                    max_pairs=capacity, max_tiles_per_group=16,
+                    rebuild_flags=torch.ones(1, dtype=torch.bool, device="cuda"),
+                    return_state=True,
+                    num_tiles=num_tiles,
+                    tile_row_group=tile_row_group,
+                    tile_col_group=tile_col_group,
+                    neighbor_list=neighbor_list,
+                    pair_offsets=pair_offsets,
+                    pair_counts=pair_counts,
+                    neighbor_list_shifts=neighbor_shifts,
+                )
+            run(positions)
+        torch.cuda.synchronize()
+        """
+    )
+    with tempfile.TemporaryDirectory() as cache_dir:
+        env = os.environ.copy()
+        env["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_dir, "inductor")
+        env["WARP_CACHE_PATH"] = os.path.join(cache_dir, "warp")
+        return subprocess.run(  # noqa: S603 - test intentionally isolates CUDA asserts
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
 
 
 # =============================================================================
@@ -540,6 +630,200 @@ class TestClusterTileCompile:
             )
 
     @pytest.mark.slow
+    @pytest.mark.parametrize("prepared_scratch", [False, True])
+    def test_cluster_tile_matrix_fullgraph_static_capacity(
+        self, device, dtype, prepared_scratch
+    ):
+        """Matrix output supports fullgraph with static or prepared capacity."""
+        torch.manual_seed(3)
+        natom = 64
+        positions = torch.rand(natom, 3, dtype=dtype, device=device) * 6.0
+        cell = _orthorhombic_cell(6.0, device, dtype)
+        eager = cluster_tile_neighbor_list(
+            positions, 2.0, cell, max_neighbors=64, max_tiles_per_group=4
+        )
+        scratch = allocate_cluster_tile_list(
+            natom, torch.device(device), dtype=dtype, max_tiles_per_group=4
+        )
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            kwargs = {"max_neighbors": 64}
+            if prepared_scratch:
+                kwargs.update(
+                    sorted_atom_index=scratch[0],
+                    morton_codes=scratch[1],
+                    sorted_pos_x=scratch[2],
+                    sorted_pos_y=scratch[3],
+                    sorted_pos_z=scratch[4],
+                    group_ctr_x=scratch[5],
+                    group_ctr_y=scratch[6],
+                    group_ctr_z=scratch[7],
+                    group_ext_x=scratch[8],
+                    group_ext_y=scratch[9],
+                    group_ext_z=scratch[10],
+                    num_tiles=scratch[11],
+                    tile_row_group=scratch[12],
+                    tile_col_group=scratch[13],
+                )
+            else:
+                kwargs["max_tiles_per_group"] = 4
+            return cluster_tile_neighbor_list(runtime_positions, 2.0, cell, **kwargs)
+
+        compiled = run(positions)
+        assert torch.equal(eager[1], compiled[1])
+        assert _per_atom_neighbor_sets(*eager, natom) == _per_atom_neighbor_sets(
+            *compiled, natom
+        )
+
+    @pytest.mark.slow
+    def test_cluster_tile_tile_fullgraph_explicit_capacity(self, device, dtype):
+        """Tile output supports fullgraph with explicit static capacity."""
+        positions = torch.rand(64, 3, dtype=dtype, device=device) * 6.0
+        cell = _orthorhombic_cell(6.0, device, dtype)
+        eager = cluster_tile_neighbor_list(
+            positions, 2.0, cell, format="tile", max_tiles_per_group=4
+        )
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            return cluster_tile_neighbor_list(
+                runtime_positions, 2.0, cell, format="tile", max_tiles_per_group=4
+            )
+
+        compiled = run(positions)
+        assert len(compiled) == 7
+        assert all(
+            torch.equal(expected, actual) for expected, actual in zip(eager, compiled)
+        )
+
+    @pytest.mark.slow
+    def test_cluster_tile_fullgraph_requires_static_capacity(self, device, dtype):
+        """Unprepared compiled single calls name the required capacity input."""
+        positions = torch.rand(32, 3, dtype=dtype, device=device)
+        cell = _orthorhombic_cell(6.0, device, dtype)
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            return cluster_tile_neighbor_list(runtime_positions, 2.0, cell)
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "compiled cluster_tile_neighbor_list requires max_tiles_per_group "
+                "when scratch buffers are not provided"
+            ),
+        ):
+            run(positions)
+
+    @pytest.mark.slow
+    def test_cluster_tile_dual_matrix_fullgraph(self, device, dtype):
+        """Dual-cutoff matrix topology supports fullgraph execution."""
+        torch.manual_seed(4)
+        natom = 64
+        positions = torch.rand(natom, 3, dtype=dtype, device=device) * 6.0
+        cell = _orthorhombic_cell(6.0, device, dtype)
+        eager = cluster_tile_neighbor_list(
+            positions,
+            1.5,
+            cell,
+            cutoff2=2.0,
+            max_neighbors=64,
+            max_tiles_per_group=4,
+        )
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.5,
+                cell,
+                cutoff2=2.0,
+                max_neighbors=64,
+                max_tiles_per_group=4,
+            )
+
+        compiled = run(positions)
+        for start in (0, 3):
+            assert torch.equal(eager[start + 1], compiled[start + 1])
+            assert _per_atom_neighbor_sets(*eager[start : start + 3], natom) == (
+                _per_atom_neighbor_sets(*compiled[start : start + 3], natom)
+            )
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("dual_cutoff", [False, True])
+    def test_cluster_tile_selective_matrix_fullgraph_reuses_buffers(
+        self, device, dtype, dual_cutoff
+    ):
+        """Selective matrix rebuild and skip preserve supplied state exactly."""
+        initial = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]], dtype=dtype, device=device
+        )
+        moved = torch.tensor(
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=dtype, device=device
+        )
+        cell = _orthorhombic_cell(8.0, device, dtype)
+        cutoff2 = 2.0 if dual_cutoff else None
+        base_kwargs = {"max_neighbors": 8}
+        if dual_cutoff:
+            base_kwargs["cutoff2"] = cutoff2
+        initial_outputs = cluster_tile_neighbor_list(initial, 1.0, cell, **base_kwargs)
+        tile_state = cluster_tile_neighbor_list(
+            initial,
+            cutoff2 if dual_cutoff else 1.0,
+            cell,
+            format="tile",
+            max_tiles_per_group=1,
+        )
+        outputs = [tensor.clone() for tensor in initial_outputs]
+        tiles = [tensor.clone() for tensor in tile_state[:3]]
+        kwargs = {
+            "return_state": True,
+            "num_tiles": tiles[0],
+            "tile_row_group": tiles[1],
+            "tile_col_group": tiles[2],
+            "neighbor_matrix": outputs[0],
+            "num_neighbors": outputs[1],
+            "neighbor_matrix_shifts": outputs[2],
+        }
+        if dual_cutoff:
+            kwargs.update(
+                neighbor_matrix2=outputs[3],
+                num_neighbors2=outputs[4],
+                neighbor_matrix_shifts2=outputs[5],
+            )
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions, rebuild_flags):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                cell,
+                **base_kwargs,
+                rebuild_flags=rebuild_flags,
+                **kwargs,
+            )
+
+        rebuilt = run(moved, torch.ones(1, dtype=torch.bool, device=device))
+        output_count = 6 if dual_cutoff else 3
+        assert all(rebuilt[index] is outputs[index] for index in range(output_count))
+        assert all(rebuilt[-3 + index] is tiles[index] for index in range(3))
+        reference = cluster_tile_neighbor_list(moved, 1.0, cell, **base_kwargs)
+        for start in range(0, output_count, 3):
+            assert torch.equal(outputs[start + 1], reference[start + 1])
+            assert _per_atom_neighbor_sets(*outputs[start : start + 3], 2) == (
+                _per_atom_neighbor_sets(*reference[start : start + 3], 2)
+            )
+        output_snapshot = [tensor.clone() for tensor in outputs]
+        tile_snapshot = [tensor.clone() for tensor in tiles]
+        skipped = run(initial, torch.zeros(1, dtype=torch.bool, device=device))
+        assert all(skipped[index] is outputs[index] for index in range(output_count))
+        assert all(
+            torch.equal(outputs[i], output_snapshot[i]) for i in range(output_count)
+        )
+        assert all(torch.equal(tiles[i], tile_snapshot[i]) for i in range(3))
+
+    @pytest.mark.slow
     def test_build_then_convert_compile(self, device, dtype):
         """Component build + query_cluster_tile should compile cleanly."""
         torch.manual_seed(1)
@@ -586,6 +870,47 @@ class TestClusterTileCompile:
             s_ref = {int(x.item()) for x in nm_ref[i, :n_i]}
             s_got = {int(x.item()) for x in nm[i, :n_i]}
             assert s_ref == s_got, f"Row {i} neighbor set mismatch under torch.compile"
+
+    @pytest.mark.slow
+    def test_direct_matrix_geometry_query_fullgraph(self, device, dtype):
+        """Direct fixed-matrix query declares Warp geometry-buffer mutation."""
+        N, cutoff = 64, 2.5
+        positions = torch.rand(N, 3, dtype=dtype, device=device) * 10.0
+        cell = _orthorhombic_cell(10.0, device, dtype)
+        state = allocate_cluster_tile_list(N, torch.device(device), dtype=dtype)
+        matrix = torch.full((N, 64), N, dtype=torch.int32, device=device)
+        counts = torch.zeros(N, dtype=torch.int32, device=device)
+        shifts = torch.zeros((N, 64, 3), dtype=torch.int32, device=device)
+        vectors = torch.zeros((N, 64, 3), dtype=dtype, device=device)
+        distances = torch.zeros((N, 64), dtype=dtype, device=device)
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            build_cluster_tile_list(runtime_positions, cutoff, cell, *state)
+            query_cluster_tile(
+                state[0],
+                state[2],
+                state[3],
+                state[4],
+                state[11],
+                state[12],
+                state[13],
+                cell,
+                cutoff,
+                N,
+                matrix,
+                counts,
+                shifts,
+                return_vectors=True,
+                return_distances=True,
+                neighbor_vectors=vectors,
+                neighbor_distances=distances,
+            )
+
+        run(positions)
+        active = torch.arange(64, device=device)[None, :] < counts[:, None]
+        assert torch.equal(distances[~active], torch.zeros_like(distances[~active]))
+        assert torch.equal(vectors[~active], torch.zeros_like(vectors[~active]))
 
     @pytest.mark.slow
     def test_segmented_coo_query_compile(self, device, dtype):
@@ -892,58 +1217,19 @@ class TestClusterTileCompile:
         assert torch.all(neighbor_list_shifts == -77)
 
     @pytest.mark.slow
-    def test_selective_coo_wrapper_fullgraph_clamps_overflow_count(self, device, dtype):
-        """Compiled valid segments report at most their written capacity."""
-        natom = 64
-        capacity = 64
-        positions = torch.zeros((natom, 3), dtype=dtype, device=device)
-        cell = _orthorhombic_cell(6.0, device, dtype)
-        num_tiles, tile_row_group, tile_col_group, *_ = cluster_tile_neighbor_list(
-            positions,
-            2.0,
-            cell,
-            format="tile",
-        )
-        neighbor_list = torch.full(
-            (2, capacity),
-            -77,
-            dtype=torch.int32,
-            device=device,
-        )
-        neighbor_list_shifts = torch.full(
-            (capacity, 3),
-            -77,
-            dtype=torch.int32,
-            device=device,
-        )
-        pair_offsets = torch.tensor([0, capacity], dtype=torch.int32, device=device)
-        pair_counts = torch.zeros(1, dtype=torch.int32, device=device)
-
-        @torch.compile(fullgraph=True)
-        def run(runtime_pair_counts):
-            return cluster_tile_neighbor_list(
-                positions,
-                2.0,
-                cell,
-                max_neighbors=64,
-                format="coo",
-                rebuild_flags=torch.ones(1, dtype=torch.bool, device=device),
-                return_state=True,
-                num_tiles=num_tiles,
-                tile_row_group=tile_row_group,
-                tile_col_group=tile_col_group,
-                neighbor_list=neighbor_list,
-                pair_offsets=pair_offsets,
-                pair_counts=runtime_pair_counts,
-                neighbor_list_shifts=neighbor_list_shifts,
-            )
-
-        result = run(pair_counts)
-
-        assert result[2].data_ptr() == pair_counts.data_ptr()
-        assert int(pair_counts.item()) == capacity
-        assert torch.all(neighbor_list != -77)
-        assert torch.all(neighbor_list_shifts != -77)
+    @pytest.mark.parametrize(
+        ("kind", "message"),
+        [
+            ("compact_tile", "cluster-tile buffer capacity exceeded"),
+            ("prepared_matrix", "cluster-tile neighbor matrix capacity exceeded"),
+            ("segmented_coo", "cluster-tile COO pair capacity exceeded"),
+        ],
+    )
+    def test_fullgraph_overflow_isolated(self, device, kind, message):
+        """Each invalid fullgraph call fails in its own CUDA process."""
+        result = _run_isolated_fullgraph_overflow(kind)
+        assert result.returncode != 0
+        assert message in result.stderr
 
 
 # =============================================================================
@@ -1121,6 +1407,125 @@ class TestClusterTileAutograd:
             f"analytical vs FD relative disagreement {max_abs_diff / max_ref:.3e}"
         )
 
+    @pytest.mark.parametrize(
+        ("return_distances", "return_vectors"),
+        [(False, True), (True, False), (True, True)],
+    )
+    @pytest.mark.slow
+    def test_matrix_geometry_fullgraph_matches_eager(
+        self, device, return_distances, return_vectors
+    ):
+        """Compiled matrix geometry matches eager topology and periodic formula."""
+        pos, cell = self._make_system(device)
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions, runtime_cell):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.5,
+                runtime_cell,
+                max_neighbors=64,
+                max_tiles_per_group=4,
+                return_distances=return_distances,
+                return_vectors=return_vectors,
+            )
+
+        eager = cluster_tile_neighbor_list(
+            pos,
+            1.5,
+            cell,
+            max_neighbors=64,
+            max_tiles_per_group=4,
+            return_distances=return_distances,
+            return_vectors=return_vectors,
+        )
+        compiled = run(pos, cell)
+        matrix, counts, shifts = compiled[:3]
+        assert all(not value.requires_grad for value in compiled[:3])
+        assert torch.equal(eager[1], counts)
+        active = torch.arange(matrix.shape[1], device=device)[None, :] < counts[:, None]
+        neighbors = torch.where(active, matrix, 0).to(torch.long)
+        expected_vectors = pos[neighbors] - pos[:, None] + shifts.to(pos.dtype) @ cell
+        expected_vectors = torch.where(
+            active[..., None], expected_vectors, torch.zeros_like(expected_vectors)
+        )
+        offset = 3
+        if return_distances:
+            torch.testing.assert_close(compiled[offset], expected_vectors.norm(dim=-1))
+            offset += 1
+        if return_vectors:
+            torch.testing.assert_close(compiled[offset], expected_vectors)
+
+    @pytest.mark.slow
+    def test_matrix_geometry_compiled_position_and_cell_gradients(self, device):
+        """Default fullgraph compilation preserves first-order geometry gradients."""
+        pos, cell = self._make_system(device)
+
+        def eager_loss(runtime_positions, runtime_cell):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.5,
+                runtime_cell,
+                max_neighbors=64,
+                max_tiles_per_group=4,
+                return_distances=True,
+            )[3].sum()
+
+        @torch.compile(fullgraph=True)
+        def compiled_loss(runtime_positions, runtime_cell):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.5,
+                runtime_cell,
+                max_neighbors=64,
+                max_tiles_per_group=4,
+                return_distances=True,
+            )[3].sum()
+
+        eager_pos = pos.clone().requires_grad_(True)
+        eager_cell = cell.clone().requires_grad_(True)
+        expected = torch.autograd.grad(
+            eager_loss(eager_pos, eager_cell), (eager_pos, eager_cell)
+        )
+        actual_pos = pos.clone().requires_grad_(True)
+        actual_cell = cell.clone().requires_grad_(True)
+        actual = torch.autograd.grad(
+            compiled_loss(actual_pos, actual_cell), (actual_pos, actual_cell)
+        )
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.slow
+    def test_matrix_geometry_compiled_coincident_hvp(self, device):
+        """Compiled coincident geometry has finite stabilized higher derivatives.
+
+        The eager backend keeps the callable fullgraph-compiled while avoiding
+        PyTorch AOTAutograd's donated-buffer double-backward limitation.
+        """
+        cell = torch.eye(3, dtype=torch.float32, device=device) * 20.0
+
+        @torch.compile(fullgraph=True, backend="eager")
+        def compiled_loss(runtime_positions):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                cell,
+                max_neighbors=8,
+                max_tiles_per_group=1,
+                return_distances=True,
+            )[3].sum()
+
+        coincident = torch.zeros(
+            (2, 3), dtype=torch.float32, device=device, requires_grad=True
+        )
+        value = compiled_loss(coincident)
+        assert value.item() == 0.0
+        first = torch.autograd.grad(value, coincident, create_graph=True)[0]
+        assert torch.equal(first, torch.zeros_like(first))
+        second = torch.autograd.grad(
+            (first * torch.ones_like(first)).sum(), coincident
+        )[0]
+        assert torch.isfinite(second).all()
+
 
 class TestClusterTileCutoff2SelectiveOverflow:
     """Coverage for single-system dual cutoff, selective rebuild, and overflow."""
@@ -1142,6 +1547,43 @@ class TestClusterTileCutoff2SelectiveOverflow:
         assert int(nn2.sum().item()) >= int(nn1.sum().item())
         assert int(nn2.sum().item()) > 0
         assert nm1.shape == nm2.shape == (3, 8)
+
+    @pytest.mark.parametrize("cutoff2", [0.91, 4.0])
+    @pytest.mark.parametrize(
+        "compiled",
+        [False, pytest.param(True, marks=pytest.mark.slow)],
+    )
+    def test_default_capacity_uses_larger_dual_cutoff(
+        self, device, dtype, cutoff2, compiled
+    ):
+        """Reversed and equal dual cutoffs retain independently referenced rows."""
+        positions = torch.arange(40, dtype=dtype, device=device).reshape(-1, 1)
+        positions = torch.cat(
+            (positions * 0.05, torch.zeros((40, 2), dtype=dtype, device=device)), dim=1
+        )
+        cell = _orthorhombic_cell(10.0, device, dtype)
+        pbc = torch.tensor([[True, True, True]], device=device)
+        if compiled:
+
+            @torch.compile(fullgraph=True)
+            def run(runtime_positions):
+                return cluster_tile_neighbor_list(
+                    runtime_positions,
+                    4.0,
+                    cell,
+                    cutoff2=cutoff2,
+                    max_tiles_per_group=2,
+                )
+
+            out = run(positions)
+        else:
+            out = cluster_tile_neighbor_list(positions, 4.0, cell, cutoff2=cutoff2)
+        for offset, reference_cutoff in ((0, 4.0), (3, cutoff2)):
+            got = _matrix_to_coo_full(*out[offset : offset + 3], positions.shape[0])
+            reference = brute_force_neighbors(positions, cell, pbc, reference_cutoff)[
+                :3
+            ]
+            assert_neighbor_lists_equal(got, reference)
 
     @pytest.mark.parametrize("rebuild_flag", [False, True])
     def test_return_state_preserves_caller_owned_buffers(
@@ -1556,7 +1998,7 @@ class TestClusterTileCutoff2SelectiveOverflow:
             positions, 2.0, cell, format="tile"
         )
 
-        with pytest.raises(NeighborOverflowError):
+        with pytest.raises(NeighborOverflowError) as caught:
             cluster_tile_neighbor_list(
                 positions,
                 2.0,
@@ -1575,17 +2017,23 @@ class TestClusterTileCutoff2SelectiveOverflow:
                     (1, 3), dtype=torch.int32, device=device
                 ),
             )
+        assert caught.value.max_neighbors == 1
+        assert caught.value.num_neighbors > 1
+        assert caught.value.system_index is None
 
     def test_matrix_overflow_raises(self, device, dtype):
         positions = torch.rand(64, 3, dtype=dtype, device=device) * 8.0
         cell = _orthorhombic_cell(8.0, device, dtype)
-        with pytest.raises(NeighborOverflowError):
+        with pytest.raises(NeighborOverflowError) as caught:
             cluster_tile_neighbor_list(positions, 3.0, cell, max_neighbors=1)
+        assert caught.value.max_neighbors == 1
+        assert caught.value.num_neighbors > 1
+        assert caught.value.system_index is None
 
     def test_compact_coo_overflow_raises(self, device, dtype):
         positions = torch.rand(64, 3, dtype=dtype, device=device) * 8.0
         cell = _orthorhombic_cell(8.0, device, dtype)
-        with pytest.raises(NeighborOverflowError):
+        with pytest.raises(NeighborOverflowError) as caught:
             cluster_tile_neighbor_list(
                 positions,
                 3.0,
@@ -1594,6 +2042,9 @@ class TestClusterTileCutoff2SelectiveOverflow:
                 max_pairs=1,
                 format="coo",
             )
+        assert caught.value.max_neighbors == 1
+        assert caught.value.num_neighbors > 1
+        assert caught.value.system_index is None
 
 
 def _per_atom_neighbor_sets(nm, nn, nms, natom):
@@ -1699,60 +2150,13 @@ class TestClusterTileCellListParity:
         n, box, cutoff = 128, 12.0, 5.0
         pos = torch.rand(n, 3, dtype=dtype, device=device) * box
         cell = _orthorhombic_cell(box, device, dtype)
-        (
-            sai,
-            mc,
-            spx,
-            spy,
-            spz,
-            gcx,
-            gcy,
-            gcz,
-            gex,
-            gey,
-            gez,
-            num_tiles,
-            trg,
-            tcg,
-        ) = allocate_cluster_tile_list(
-            n, torch.device(device), dtype=dtype, max_tiles_per_group=1
-        )
-        build_cluster_tile_list(
-            pos,
-            cutoff,
-            cell,
-            sai,
-            mc,
-            spx,
-            spy,
-            spz,
-            gcx,
-            gcy,
-            gcz,
-            gex,
-            gey,
-            gez,
-            num_tiles,
-            trg,
-            tcg,
-        )
-        assert int(num_tiles.item()) > int(trg.shape[0])  # overflow really occurred
-        nm = torch.empty((n, 256), dtype=torch.int32, device=device)
-        nn = torch.zeros(n, dtype=torch.int32, device=device)
-        nms = torch.empty((n, 256, 3), dtype=torch.int32, device=device)
-        with pytest.raises(NeighborOverflowError):
-            query_cluster_tile(
-                sai,
-                spx,
-                spy,
-                spz,
-                num_tiles,
-                trg,
-                tcg,
-                cell,
+        with pytest.raises(TileBufferOverflow) as caught:
+            cluster_tile_neighbor_list(
+                pos,
                 cutoff,
-                n,
-                nm,
-                nn,
-                nms,
+                cell,
+                max_neighbors=256,
+                max_tiles_per_group=1,
             )
+        assert caught.value.num_tiles > caught.value.max_tiles
+        assert caught.value.system_index is None
