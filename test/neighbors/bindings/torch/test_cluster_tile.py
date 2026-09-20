@@ -70,6 +70,37 @@ def _orthorhombic_cell(
     return (torch.eye(3, dtype=dtype, device=device) * cell_size).reshape(1, 3, 3)
 
 
+def _compact_coo_pair_sets(
+    neighbor_list: torch.Tensor,
+    neighbor_ptr: torch.Tensor,
+    shifts: torch.Tensor,
+) -> list[frozenset[tuple[int, int, int, int]]]:
+    """Validate CSR ownership and return order-independent rows."""
+    pointer = neighbor_ptr.cpu().tolist()
+    pairs = neighbor_list.cpu()
+    shifts_cpu = shifts.cpu()
+    natom = neighbor_ptr.shape[0] - 1
+    assert pointer[0] == 0
+    assert pointer[-1] == neighbor_list.shape[1]
+    assert all(start <= stop for start, stop in zip(pointer[:-1], pointer[1:]))
+    rows = []
+    for source, (start, stop) in enumerate(zip(pointer[:-1], pointer[1:])):
+        assert torch.all(pairs[0, start:stop] == source)
+        rows.append(
+            frozenset(
+                (
+                    int(pairs[1, slot]),
+                    int(shifts_cpu[slot, 0]),
+                    int(shifts_cpu[slot, 1]),
+                    int(shifts_cpu[slot, 2]),
+                )
+                for slot in range(start, stop)
+            )
+        )
+    assert len(rows) == natom
+    return rows
+
+
 def _run_isolated_fullgraph_overflow(kind: str) -> subprocess.CompletedProcess[str]:
     """Run one invalid fullgraph call in a fresh process and cache."""
     script = textwrap.dedent(
@@ -151,6 +182,49 @@ def _run_isolated_fullgraph_overflow(kind: str) -> subprocess.CompletedProcess[s
         )
 
 
+def _run_isolated_exact_coo_overflow() -> subprocess.CompletedProcess[str]:
+    """Run the exact-COO device assertion in a fresh CUDA process."""
+    script = textwrap.dedent(
+        """
+        import torch
+        from nvalchemiops.torch.neighbors.cluster_tile import cluster_tile_neighbor_list
+
+        positions = torch.zeros((64, 3), dtype=torch.float32, device="cuda")
+        cell = torch.eye(3, dtype=torch.float32, device="cuda").reshape(1, 3, 3) * 8.0
+
+        @torch.compile(fullgraph=True)
+        def run(values):
+            return cluster_tile_neighbor_list(
+                values,
+                2.0,
+                cell,
+                format="coo",
+                max_neighbors=64,
+                max_pairs=1,
+                max_tiles_per_group=2,
+            )
+
+        print("OVERFLOW_CALL_STARTED:exact_coo", flush=True)
+        run(positions)
+        torch.cuda.synchronize()
+        print("OVERFLOW_CALL_RETURNED:exact_coo", flush=True)
+        """
+    )
+    with tempfile.TemporaryDirectory() as cache_dir:
+        env = os.environ.copy()
+        env["CUDA_LAUNCH_BLOCKING"] = "1"
+        env["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_dir, "inductor")
+        env["WARP_CACHE_PATH"] = os.path.join(cache_dir, "warp")
+        return subprocess.run(  # noqa: S603 - test intentionally isolates CUDA asserts
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=180,
+        )
+
+
 # =============================================================================
 # Correctness
 # =============================================================================
@@ -191,6 +265,34 @@ class TestTileNeighborListCorrectness:
         torch.testing.assert_close(shifts[active], expected_shifts[active])
         torch.testing.assert_close(distances, expected_distances)
         torch.testing.assert_close(vectors, expected_vectors)
+
+    def test_compact_coo_current_stream_geometry(
+        self, device, dtype, torch_stream_runner
+    ):
+        """Exact COO fill and prefix packing stay on the caller's stream."""
+        source = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        )
+        positions = torch.empty_like(source)
+        cell = _orthorhombic_cell(8.0, device, dtype)
+        _, snapshot, expected = torch_stream_runner(
+            source,
+            positions,
+            lambda value: cluster_tile_neighbor_list(
+                value,
+                1.0,
+                cell,
+                format="coo",
+                max_pairs=8,
+                max_tiles_per_group=1,
+                return_vectors=True,
+                return_distances=True,
+            ),
+        )
+        for result, reference in zip(snapshot, expected, strict=True):
+            torch.testing.assert_close(result, reference)
 
     def test_single_atom_no_neighbors(self, device, dtype):
         """Single atom system should have no neighbors."""
@@ -374,11 +476,10 @@ class TestTileNeighborListCorrectness:
         i_ref, j_ref, u_ref, _ = brute_force_neighbors(positions, cell, pbc, cutoff)
         assert_neighbor_lists_equal((i_got, j_got, u_got), (i_ref, j_ref, u_ref))
 
-    @requires_vesin
     def test_return_neighbor_list(self, device, dtype):
         """COO output (``format="coo"``) matches matrix output."""
         positions, cell, _ = create_random_system(
-            num_atoms=64,
+            num_atoms=65,
             cell_size=10.0,
             dtype=dtype,
             device=device,
@@ -394,14 +495,164 @@ class TestTileNeighborListCorrectness:
             format="coo",
         )
         assert neighbor_list.shape[0] == 2
+        coo_rows = _compact_coo_pair_sets(neighbor_list, neighbor_ptr, shifts)
         # Compare pair counts against the matrix-mode result.
-        nm, nn, _nms = cluster_tile_neighbor_list(
+        nm, nn, nms = cluster_tile_neighbor_list(
             positions,
             cutoff,
             cell,
             max_neighbors=128,
         )
         assert int(nn.sum().item()) == int(neighbor_list.shape[1])
+        assert coo_rows == _per_atom_neighbor_sets(nm, nn, nms, positions.shape[0])
+
+    def test_compact_coo_uses_global_capacity(self, device, dtype):
+        """Exact COO is bounded globally rather than by a matrix row capacity."""
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.8, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        )
+        cell = _orthorhombic_cell(8.0, device, dtype)
+
+        pairs, pointer, shifts = cluster_tile_neighbor_list(
+            positions,
+            1.0,
+            cell,
+            format="coo",
+            max_neighbors=1,
+            max_pairs=6,
+            max_tiles_per_group=1,
+        )
+
+        assert pairs.shape == (2, 6)
+        assert pointer.tolist() == [0, 2, 4, 6]
+        _compact_coo_pair_sets(pairs, pointer, shifts)
+
+    def test_compact_coo_dense_tiles_exact_and_one_short(self, device, dtype):
+        """Dense diagonal and off-diagonal tiles fill exact CSR capacity."""
+        natom = 48
+        expected_pairs = natom * (natom - 1)
+        positions = torch.zeros((natom, 3), dtype=dtype, device=device)
+        cell = _orthorhombic_cell(8.0, device, dtype)
+
+        pairs, pointer, shifts = cluster_tile_neighbor_list(
+            positions,
+            1.0,
+            cell,
+            format="coo",
+            max_pairs=expected_pairs,
+            max_tiles_per_group=2,
+        )
+
+        assert pairs.shape == (2, expected_pairs)
+        assert torch.equal(
+            pointer[1:] - pointer[:-1],
+            torch.full((natom,), natom - 1, dtype=torch.int32, device=device),
+        )
+        rows = _compact_coo_pair_sets(pairs, pointer, shifts)
+        assert all(len(row) == natom - 1 for row in rows)
+
+        with pytest.raises(NeighborOverflowError) as caught:
+            cluster_tile_neighbor_list(
+                positions,
+                1.0,
+                cell,
+                format="coo",
+                max_pairs=expected_pairs - 1,
+                max_tiles_per_group=2,
+            )
+        assert caught.value.max_neighbors == expected_pairs - 1
+        assert caught.value.num_neighbors == expected_pairs
+
+    def test_compact_coo_half_cell_tie_keeps_reverse_shift(self, device, dtype):
+        """A half-cell tie emits opposite shifts for the two CSR rows."""
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        )
+        cell = _orthorhombic_cell(4.0, device, dtype)
+
+        pairs, pointer, shifts = cluster_tile_neighbor_list(
+            positions,
+            2.1,
+            cell,
+            format="coo",
+            max_pairs=2,
+            max_tiles_per_group=1,
+        )
+
+        rows = _compact_coo_pair_sets(pairs, pointer, shifts)
+        assert len(rows[0]) == len(rows[1]) == 1
+        forward = next(iter(rows[0]))
+        reverse = next(iter(rows[1]))
+        assert forward[0] == 1
+        assert reverse[0] == 0
+        assert reverse[1:] == tuple(-value for value in forward[1:])
+
+    def test_compact_coo_ignores_oversized_physical_tail(self, device, dtype):
+        """Only the logical compact capacity may be written or returned."""
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.8, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        )
+        cell = _orthorhombic_cell(8.0, device, dtype)
+        logical_capacity = 8
+        physical_capacity = 13
+        pair_buffer = torch.full(
+            (2, physical_capacity), -91, dtype=torch.int32, device=device
+        )
+        shift_buffer = torch.full(
+            (physical_capacity, 3), -92, dtype=torch.int32, device=device
+        )
+        vector_buffer = torch.full(
+            (physical_capacity, 3), -93.0, dtype=dtype, device=device
+        )
+        distance_buffer = torch.full(
+            (physical_capacity,), -94.0, dtype=dtype, device=device
+        )
+
+        pairs, pointer, shifts, exact_distances, exact_vectors = (
+            cluster_tile_neighbor_list(
+                positions,
+                1.0,
+                cell,
+                format="coo",
+                max_neighbors=8,
+                max_pairs=logical_capacity,
+                max_tiles_per_group=1,
+                neighbor_list=pair_buffer,
+                neighbor_list_shifts=shift_buffer,
+                return_vectors=True,
+                return_distances=True,
+                neighbor_vectors=vector_buffer,
+                neighbor_distances=distance_buffer,
+            )
+        )
+
+        _compact_coo_pair_sets(pairs, pointer, shifts)
+        count = pairs.shape[1]
+        expected_vectors = (
+            positions[pairs[1].long()]
+            - positions[pairs[0].long()]
+            + shifts.to(dtype) @ cell[0]
+        )
+        torch.testing.assert_close(vector_buffer[:count], expected_vectors)
+        torch.testing.assert_close(
+            distance_buffer[:count], expected_vectors.norm(dim=-1)
+        )
+        torch.testing.assert_close(exact_vectors, expected_vectors)
+        torch.testing.assert_close(exact_distances, expected_vectors.norm(dim=-1))
+        assert pairs.data_ptr() != pair_buffer.data_ptr()
+        assert shifts.data_ptr() != shift_buffer.data_ptr()
+        assert exact_vectors.data_ptr() != vector_buffer.data_ptr()
+        assert exact_distances.data_ptr() != distance_buffer.data_ptr()
+        assert torch.all(pair_buffer[:, logical_capacity:] == -91)
+        assert torch.all(shift_buffer[logical_capacity:] == -92)
+        assert torch.all(vector_buffer[logical_capacity:] == -93)
+        assert torch.all(distance_buffer[logical_capacity:] == -94)
 
     def test_component_API_matches_convenience(self, device, dtype):
         """Explicit component calls produce the same state as the convenience wrapper."""
@@ -618,6 +869,123 @@ class TestTileNeighborListErrors:
                 neighbor_matrix2=torch.empty((2, 4), dtype=torch.int32),
             )
 
+    @pytest.mark.parametrize(
+        ("buffer_name", "invalid_kind"),
+        [
+            ("neighbor_list", "dtype"),
+            ("neighbor_list", "device"),
+            ("neighbor_list", "shape"),
+            ("neighbor_list", "capacity"),
+            ("neighbor_list_shifts", "dtype"),
+            ("neighbor_list_shifts", "device"),
+            ("neighbor_list_shifts", "shape"),
+            ("neighbor_list_shifts", "capacity"),
+            ("pair_counter", "dtype"),
+            ("pair_counter", "device"),
+            ("pair_counter", "shape"),
+        ],
+    )
+    def test_compact_coo_rejects_invalid_outputs_before_mutation(
+        self,
+        device,
+        buffer_name,
+        invalid_kind,
+    ):
+        """Malformed compact COO storage fails before any supplied mutation."""
+        capacity = 16
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=torch.float32,
+            device=device,
+        )
+        cell = _orthorhombic_cell(20.0, device)
+        scratch_names = (
+            "sorted_atom_index",
+            "morton_codes",
+            "sorted_pos_x",
+            "sorted_pos_y",
+            "sorted_pos_z",
+            "group_ctr_x",
+            "group_ctr_y",
+            "group_ctr_z",
+            "group_ext_x",
+            "group_ext_y",
+            "group_ext_z",
+            "num_tiles",
+            "tile_row_group",
+            "tile_col_group",
+        )
+        scratch = dict(
+            zip(
+                scratch_names,
+                allocate_cluster_tile_list(
+                    positions.shape[0],
+                    torch.device(device),
+                    dtype=positions.dtype,
+                    max_tiles_per_group=1,
+                ),
+            )
+        )
+        outputs = {
+            "neighbor_list": torch.full(
+                (2, capacity), -31, dtype=torch.int32, device=device
+            ),
+            "neighbor_list_shifts": torch.full(
+                (capacity, 3), -32, dtype=torch.int32, device=device
+            ),
+            "pair_counter": torch.full((1,), -33, dtype=torch.int32, device=device),
+        }
+        shapes = {
+            "neighbor_list": (2, capacity),
+            "neighbor_list_shifts": (capacity, 3),
+            "pair_counter": (1,),
+        }
+        invalid_shape = {
+            "neighbor_list": (capacity, 2),
+            "neighbor_list_shifts": (capacity, 2),
+            "pair_counter": (2,),
+        }
+        if invalid_kind == "dtype":
+            outputs[buffer_name] = torch.full(
+                shapes[buffer_name], -1.0, dtype=torch.float32, device=device
+            )
+        elif invalid_kind == "device":
+            outputs[buffer_name] = torch.full(
+                shapes[buffer_name], -1, dtype=torch.int32, device="cpu"
+            )
+        elif invalid_kind == "shape":
+            outputs[buffer_name] = torch.full(
+                invalid_shape[buffer_name], -1, dtype=torch.int32, device=device
+            )
+        else:
+            short_shape = (
+                (2, capacity - 1)
+                if buffer_name == "neighbor_list"
+                else (capacity - 1, 3)
+            )
+            outputs[buffer_name] = torch.full(
+                short_shape, -1, dtype=torch.int32, device=device
+            )
+        supplied = {**scratch, **outputs}
+        for index, tensor in enumerate(scratch.values(), start=1):
+            tensor.fill_(index)
+        before = {name: tensor.clone() for name, tensor in supplied.items()}
+
+        with pytest.raises(ValueError, match=buffer_name):
+            cluster_tile_neighbor_list(
+                positions,
+                1.0,
+                cell,
+                format="coo",
+                max_neighbors=8,
+                max_pairs=capacity,
+                max_tiles_per_group=1,
+                **supplied,
+            )
+        assert all(
+            torch.equal(before[name], tensor) for name, tensor in supplied.items()
+        )
+
     def test_wrong_dtype(self, device):
         positions = torch.rand(32, 3, dtype=torch.float64, device=device) * 10.0
         cell = _orthorhombic_cell(10.0, device)
@@ -797,6 +1165,178 @@ class TestClusterTileCompile:
         assert _per_atom_neighbor_sets(*eager, natom) == _per_atom_neighbor_sets(
             *compiled, natom
         )
+
+    @pytest.mark.slow
+    def test_compact_coo_fullgraph_dynamic_pair_count(self, device, dtype):
+        """One fullgraph callable returns distinct exact COO lengths."""
+        cell = _orthorhombic_cell(20.0, device, dtype)
+        close = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.8, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        )
+        sparse = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        )
+        empty = torch.tensor(
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+        )
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                cell,
+                format="coo",
+                max_neighbors=1,
+                max_pairs=16,
+                max_tiles_per_group=1,
+            )
+
+        for positions, expected_count in ((close, 6), (sparse, 2), (empty, 0)):
+            eager = cluster_tile_neighbor_list(
+                positions,
+                1.0,
+                cell,
+                format="coo",
+                max_neighbors=1,
+                max_pairs=16,
+                max_tiles_per_group=1,
+            )
+            compiled = run(positions)
+            assert compiled[0].shape == (2, expected_count)
+            assert _compact_coo_pair_sets(*compiled) == _compact_coo_pair_sets(*eager)
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize(
+        ("return_distances", "return_vectors"),
+        [(True, False), (False, True), (True, True)],
+    )
+    def test_compact_coo_geometry_fullgraph_return_contract(
+        self, device, dtype, return_distances, return_vectors
+    ):
+        """Exact COO returns requested geometry without caller-owned buffers."""
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
+        empty = torch.tensor(
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=device,
+            requires_grad=True,
+        )
+        cell = _orthorhombic_cell(8.0, device, dtype)
+
+        def call(runtime_positions):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                cell,
+                format="coo",
+                max_pairs=8,
+                max_tiles_per_group=1,
+                return_distances=return_distances,
+                return_vectors=return_vectors,
+            )
+
+        compiled_call = torch.compile(call, fullgraph=True)
+        for runtime_positions in (positions, empty):
+            for result in (
+                call(runtime_positions),
+                compiled_call(runtime_positions),
+            ):
+                pairs, pointer, shifts, *geometry = result
+                _compact_coo_pair_sets(pairs, pointer, shifts)
+                expected_vectors = (
+                    runtime_positions[pairs[1].long()]
+                    - runtime_positions[pairs[0].long()]
+                    + shifts.to(dtype) @ cell[0]
+                )
+                expected_length = 3 + int(return_distances) + int(return_vectors)
+                assert len(result) == expected_length
+                geometry_index = 0
+                if return_distances:
+                    distances = geometry[geometry_index]
+                    geometry_index += 1
+                    assert distances.shape == (pairs.shape[1],)
+                    assert distances.requires_grad
+                    torch.testing.assert_close(distances, expected_vectors.norm(dim=-1))
+                if return_vectors:
+                    vectors = geometry[geometry_index]
+                    assert vectors.shape == (pairs.shape[1], 3)
+                    assert vectors.requires_grad
+                    torch.testing.assert_close(vectors, expected_vectors)
+
+    @pytest.mark.slow
+    def test_compact_coo_fullgraph_empty_atoms(self, device, dtype):
+        """Fullgraph exact COO handles an empty atom tensor."""
+        positions = torch.empty((0, 3), dtype=dtype, device=device)
+        cell = _orthorhombic_cell(20.0, device, dtype)
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                cell,
+                format="coo",
+                max_neighbors=8,
+                max_pairs=8,
+                max_tiles_per_group=1,
+            )
+
+        pairs, pointer, shifts = run(positions)
+        assert pairs.shape == (2, 0)
+        assert pointer.tolist() == [0]
+        assert shifts.shape == (0, 3)
+
+    @pytest.mark.slow
+    def test_compact_coo_fullgraph_empty_geometry(self, device, dtype):
+        """Fullgraph exact COO returns correctly shaped empty geometry."""
+        positions = torch.empty((0, 3), dtype=dtype, device=device)
+        cell = _orthorhombic_cell(20.0, device, dtype)
+
+        @torch.compile(fullgraph=True)
+        def run(runtime_positions):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                cell,
+                format="coo",
+                max_pairs=8,
+                max_tiles_per_group=1,
+                return_distances=True,
+                return_vectors=True,
+            )
+
+        pairs, pointer, shifts, distances, vectors = run(positions)
+        assert pairs.shape == (2, 0)
+        assert pointer.tolist() == [0]
+        assert shifts.shape == (0, 3)
+        assert distances.shape == (0,)
+        assert vectors.shape == (0, 3)
+
+    @pytest.mark.slow
+    def test_compact_coo_fullgraph_overflow_isolated(self, device):
+        """Exact COO overflow fails before a truncated result can return."""
+        result = _run_isolated_exact_coo_overflow()
+        output = result.stdout + result.stderr
+        assert "OVERFLOW_CALL_STARTED:exact_coo" in output
+        assert "OVERFLOW_CALL_RETURNED:exact_coo" not in output
+        assert result.returncode != 0, output
+        lowered = output.lower()
+        assert "cluster-tile coo pair capacity exceeded" in lowered or any(
+            token in lowered
+            for token in ("device-side assert triggered", "device-side assertion")
+        ), output
 
     @pytest.mark.slow
     def test_cluster_tile_tile_fullgraph_explicit_capacity(self, device, dtype):
@@ -1782,6 +2322,209 @@ class TestClusterTileAutograd:
         assert actual_distances.data_ptr() != distance_buffer.data_ptr()
         torch.testing.assert_close(distance_buffer, actual_distances.detach())
         assert not distance_buffer.requires_grad and distance_buffer.grad_fn is None
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize(
+        ("return_distances", "return_vectors"),
+        [(True, False), (False, True), (True, True)],
+        ids=["distances", "vectors", "both"],
+    )
+    def test_compact_coo_geometry_buffer_lifecycle(
+        self, device, compiled, return_distances, return_vectors
+    ):
+        """Exact COO buffers stay detached across changing grad modes."""
+        cell = _orthorhombic_cell(20.0, device)
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        def call(runtime_positions, runtime_cell, vectors, distances):
+            return cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                runtime_cell,
+                format="coo",
+                max_neighbors=8,
+                max_pairs=16,
+                max_tiles_per_group=1,
+                return_vectors=return_vectors,
+                return_distances=return_distances,
+                neighbor_vectors=vectors,
+                neighbor_distances=distances,
+            )
+
+        run = torch.compile(call, fullgraph=True) if compiled else call
+        vectors = torch.full((16, 3), float("nan"), device=device)
+        distances = torch.full((16,), float("nan"), device=device)
+        grad_positions = positions.clone().requires_grad_(True)
+        grad_cell = cell.clone().requires_grad_(True)
+        output = run(
+            grad_positions,
+            grad_cell,
+            vectors,
+            distances,
+        )
+        pairs, pointer, shifts = output[:3]
+        _compact_coo_pair_sets(pairs, pointer, shifts)
+        count = pairs.shape[1]
+        expected_vectors = (
+            grad_positions[pairs[1].long()]
+            - grad_positions[pairs[0].long()]
+            + shifts.to(grad_positions.dtype) @ grad_cell[0]
+        )
+        output_index = 3
+        if return_distances:
+            exact_distances = output[output_index]
+            output_index += 1
+            torch.testing.assert_close(distances[:count], expected_vectors.norm(dim=-1))
+            torch.testing.assert_close(exact_distances, expected_vectors.norm(dim=-1))
+            assert exact_distances.data_ptr() != distances.data_ptr()
+        if return_vectors:
+            exact_vectors = output[output_index]
+            torch.testing.assert_close(vectors[:count], expected_vectors)
+            torch.testing.assert_close(exact_vectors, expected_vectors)
+            assert exact_vectors.data_ptr() != vectors.data_ptr()
+        gradients = torch.autograd.grad(
+            sum(tensor.square().sum() for tensor in output[3:]),
+            (grad_positions, grad_cell),
+        )
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert all(not tensor.requires_grad for tensor in (pairs, pointer, shifts))
+        assert not vectors.requires_grad and vectors.grad_fn is None
+        assert not distances.requires_grad and distances.grad_fn is None
+
+        with torch.no_grad():
+            no_grad_output = run(positions + 0.05, cell, vectors, distances)
+        assert all(not tensor.requires_grad for tensor in no_grad_output[3:])
+        assert not vectors.requires_grad and vectors.grad_fn is None
+        assert not distances.requires_grad and distances.grad_fn is None
+
+        final_positions = (positions + 0.1).requires_grad_(True)
+        final_cell = cell.clone().requires_grad_(True)
+        final_output = run(final_positions, final_cell, vectors, distances)
+        final_gradients = torch.autograd.grad(
+            sum(tensor.square().sum() for tensor in final_output[3:]),
+            (final_positions, final_cell),
+        )
+        assert all(torch.isfinite(gradient).all() for gradient in final_gradients)
+        assert not vectors.requires_grad and vectors.grad_fn is None
+        assert not distances.requires_grad and distances.grad_fn is None
+
+    @pytest.mark.parametrize(
+        ("buffer_name", "shape"),
+        [
+            ("neighbor_distances", (16,)),
+            ("neighbor_vectors", (16, 3)),
+        ],
+    )
+    def test_compact_coo_rejects_grad_tracked_geometry_buffers(
+        self, device, buffer_name, shape
+    ):
+        """Exact COO rejects grad-tracked capacity buffers before mutation."""
+        cell = _orthorhombic_cell(20.0, device)
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=torch.float32,
+            device=device,
+        )
+        buffer = torch.full(shape, -7.0, device=device, requires_grad=True)
+        scratch_names = (
+            "sorted_atom_index",
+            "morton_codes",
+            "sorted_pos_x",
+            "sorted_pos_y",
+            "sorted_pos_z",
+            "group_ctr_x",
+            "group_ctr_y",
+            "group_ctr_z",
+            "group_ext_x",
+            "group_ext_y",
+            "group_ext_z",
+            "num_tiles",
+            "tile_row_group",
+            "tile_col_group",
+        )
+        scratch = dict(
+            zip(
+                scratch_names,
+                allocate_cluster_tile_list(
+                    positions.shape[0],
+                    torch.device(device),
+                    dtype=positions.dtype,
+                    max_tiles_per_group=1,
+                ),
+            )
+        )
+        for index, tensor in enumerate(scratch.values(), start=1):
+            tensor.fill_(index)
+        supplied = {
+            **scratch,
+            "neighbor_list": torch.full((2, 16), -31, dtype=torch.int32, device=device),
+            "neighbor_list_shifts": torch.full(
+                (16, 3), -32, dtype=torch.int32, device=device
+            ),
+            "pair_counter": torch.full((1,), -33, dtype=torch.int32, device=device),
+            buffer_name: buffer,
+        }
+        before = {name: tensor.detach().clone() for name, tensor in supplied.items()}
+        kwargs = {
+            "return_distances": buffer_name == "neighbor_distances",
+            "return_vectors": buffer_name == "neighbor_vectors",
+            **supplied,
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=rf"{buffer_name} must not require gradients",
+        ):
+            cluster_tile_neighbor_list(
+                positions,
+                1.0,
+                cell,
+                format="coo",
+                max_neighbors=8,
+                max_pairs=16,
+                max_tiles_per_group=1,
+                **kwargs,
+            )
+        assert all(
+            torch.equal(before[name], tensor.detach())
+            for name, tensor in supplied.items()
+        )
+
+    @pytest.mark.slow
+    def test_compact_coo_geometry_compiled_coincident_hvp(self, device):
+        """Exact zero COO distances retain finite stabilized second derivatives."""
+        cell = _orthorhombic_cell(20.0, device)
+
+        @torch.compile(fullgraph=True, backend="eager")
+        def loss(runtime_positions):
+            _pairs, _, _, distances = cluster_tile_neighbor_list(
+                runtime_positions,
+                1.0,
+                cell,
+                format="coo",
+                max_neighbors=8,
+                max_pairs=8,
+                max_tiles_per_group=1,
+                return_distances=True,
+            )
+            return distances.sum()
+
+        positions = torch.zeros(
+            (2, 3), dtype=torch.float32, device=device, requires_grad=True
+        )
+        value = loss(positions)
+        first = torch.autograd.grad(value, positions, create_graph=True)[0]
+        second = torch.autograd.grad((first * torch.ones_like(first)).sum(), positions)[
+            0
+        ]
+        assert value.item() == 0.0
+        assert torch.equal(first, torch.zeros_like(first))
+        assert torch.isfinite(second).all()
 
     @pytest.mark.slow
     def test_matrix_geometry_compiled_coincident_hvp(self, device):

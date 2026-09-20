@@ -147,6 +147,186 @@ def _check_neighbor_capacity(
     return num_neighbors
 
 
+def _prepare_compact_coo_geometry_buffers(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    capacity: int,
+    return_vectors: bool,
+    return_distances: bool,
+    neighbor_vectors: torch.Tensor | None,
+    neighbor_distances: torch.Tensor | None,
+    allocate_missing: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate or validate compact-COO geometry buffers and sentinels."""
+    if return_vectors:
+        if neighbor_vectors is None:
+            vector_capacity = capacity if allocate_missing else 1
+            neighbor_vectors = torch.empty(
+                (vector_capacity, 3), dtype=dtype, device=device
+            )
+        elif (
+            neighbor_vectors.device != device
+            or neighbor_vectors.dtype != dtype
+            or neighbor_vectors.ndim != 2
+            or neighbor_vectors.shape[1] != 3
+            or neighbor_vectors.shape[0] < capacity
+        ):
+            raise ValueError(
+                "neighbor_vectors must have shape (capacity, 3), matching "
+                "positions dtype and device, with capacity at least max_pairs"
+            )
+        if neighbor_vectors.requires_grad:
+            raise ValueError(
+                "neighbor_vectors must not require gradients; differentiate the "
+                "returned geometry instead"
+            )
+    else:
+        neighbor_vectors = torch.empty((1, 3), dtype=dtype, device=device)
+
+    if return_distances:
+        if neighbor_distances is None:
+            distance_capacity = capacity if allocate_missing else 1
+            neighbor_distances = torch.empty(
+                distance_capacity, dtype=dtype, device=device
+            )
+        elif (
+            neighbor_distances.device != device
+            or neighbor_distances.dtype != dtype
+            or neighbor_distances.ndim != 1
+            or neighbor_distances.shape[0] < capacity
+        ):
+            raise ValueError(
+                "neighbor_distances must have shape (capacity,), matching "
+                "positions dtype and device, with capacity at least max_pairs"
+            )
+        if neighbor_distances.requires_grad:
+            raise ValueError(
+                "neighbor_distances must not require gradients; differentiate the "
+                "returned geometry instead"
+            )
+    else:
+        neighbor_distances = torch.empty(1, dtype=dtype, device=device)
+
+    return neighbor_vectors, neighbor_distances
+
+
+def _validate_compact_coo_outputs(
+    *,
+    device: torch.device,
+    capacity: int,
+    neighbor_list: torch.Tensor | None,
+    neighbor_list_shifts: torch.Tensor | None,
+    pair_counter: torch.Tensor | None,
+) -> None:
+    """Validate caller-owned compact-COO outputs before mutation."""
+    if neighbor_list is not None and (
+        neighbor_list.device != device
+        or neighbor_list.dtype != torch.int32
+        or neighbor_list.ndim != 2
+        or neighbor_list.shape[0] != 2
+        or neighbor_list.shape[1] < capacity
+    ):
+        raise ValueError(
+            "neighbor_list must have shape (2, capacity), dtype int32, "
+            "match positions.device, and have capacity at least max_pairs"
+        )
+    if neighbor_list_shifts is not None and (
+        neighbor_list_shifts.device != device
+        or neighbor_list_shifts.dtype != torch.int32
+        or neighbor_list_shifts.ndim != 2
+        or neighbor_list_shifts.shape[1] != 3
+        or neighbor_list_shifts.shape[0] < capacity
+    ):
+        raise ValueError(
+            "neighbor_list_shifts must have shape (capacity, 3), dtype int32, "
+            "match positions.device, and have capacity at least max_pairs"
+        )
+    if pair_counter is not None and (
+        pair_counter.device != device
+        or pair_counter.dtype != torch.int32
+        or pair_counter.shape != (1,)
+    ):
+        raise ValueError(
+            "pair_counter must have shape (1,), dtype int32, and match positions.device"
+        )
+
+
+@torch.library.custom_op("nvalchemiops::_compact_coo_prefix", mutates_args=())
+def _compact_coo_prefix(
+    pair_count: torch.Tensor,
+    coo_list: torch.Tensor,
+    coo_shifts: torch.Tensor,
+    neighbor_vectors: torch.Tensor,
+    neighbor_distances: torch.Tensor,
+    capacity: int,
+    resolved_count: int,
+    copy_vectors: bool,
+    copy_distances: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy the active compact-COO prefix into exact, non-aliasing outputs."""
+    num_pairs = (
+        int(resolved_count)
+        if resolved_count >= 0
+        else int(pair_count.reshape(-1)[0].item())
+    )
+    copy_length = max(0, min(num_pairs, int(capacity)))
+    storage_length = max(copy_length, 1)
+
+    pairs = coo_list.new_empty((2, storage_length))[:, :copy_length]
+    shifts = coo_shifts.new_empty((storage_length, 3))[:copy_length]
+    if copy_length:
+        pairs.copy_(coo_list[:copy_length].transpose(0, 1))
+        shifts.copy_(coo_shifts[:copy_length])
+
+    vector_length = storage_length if copy_vectors else 1
+    vectors = neighbor_vectors.new_empty((vector_length, 3))[
+        : copy_length if copy_vectors else 0
+    ]
+    if copy_vectors and copy_length:
+        vectors.copy_(neighbor_vectors[:copy_length])
+
+    distance_length = storage_length if copy_distances else 1
+    distances = neighbor_distances.new_empty(distance_length)[
+        : copy_length if copy_distances else 0
+    ]
+    if copy_distances and copy_length:
+        distances.copy_(neighbor_distances[:copy_length])
+    return pairs, shifts, vectors, distances
+
+
+@_compact_coo_prefix.register_fake
+def _(
+    pair_count: torch.Tensor,
+    coo_list: torch.Tensor,
+    coo_shifts: torch.Tensor,
+    neighbor_vectors: torch.Tensor,
+    neighbor_distances: torch.Tensor,
+    capacity: int,
+    resolved_count: int,
+    copy_vectors: bool,
+    copy_distances: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if resolved_count >= 0:
+        num_pairs = min(int(resolved_count), int(capacity))
+    else:
+        ctx = torch.library.get_ctx()
+        num_pairs = ctx.new_dynamic_size(min=0, max=int(capacity))
+    pairs = coo_list.new_empty((2, num_pairs))
+    shifts = coo_shifts.new_empty((num_pairs, 3))
+    vectors = (
+        neighbor_vectors.new_empty((num_pairs, 3))
+        if copy_vectors
+        else neighbor_vectors.new_empty((0, 3))
+    )
+    distances = (
+        neighbor_distances.new_empty((num_pairs,))
+        if copy_distances
+        else neighbor_distances.new_empty((0,))
+    )
+    return pairs, shifts, vectors, distances
+
+
 def _validate_pair_params_present(
     pair_fn: object,
     pair_params: torch.Tensor | None,
