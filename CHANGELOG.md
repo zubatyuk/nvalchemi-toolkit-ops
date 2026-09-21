@@ -37,6 +37,23 @@
   Torch `cluster_tile_neighbor_list` and JAX `build_cluster_tile_list`,
   `batch_build_cluster_tile_list`, `cluster_tile_neighbor_list`, and
   `batch_cluster_tile_neighbor_list` now accept `max_tiles_per_group`.
+- PyTorch cluster-tile neighbor lists now support
+  `torch.compile(fullgraph=True)` for tile, matrix, dual-cutoff matrix, and
+  exact COO output, including differentiable pair geometry. Exact COO is
+  written directly in source-grouped CSR order. Prepare reusable fixed-layout
+  storage with `prepare_cluster_tile(...)`, then execute it with
+  `cluster_tile_neighbor_list(..., state=state)` or
+  `batch_cluster_tile_neighbor_list(..., state=state)`, with optional selective
+  matrix rebuilds for single systems and batches. Eager all-false selective
+  calls return immediately. Ordinary compiled calls keep rebuild flags on the
+  device and use a fixed inverse, sort, build, query, and tail sequence while
+  false flags preserve existing topology.
+- Warmed, compiled prepared matrix-topology calls can be captured with
+  `torch.cuda.CUDAGraph` and replayed after copying new positions, cells, or
+  selective rebuild flags into the original input tensors. Replay retains the
+  fixed captured inverse, sort, build, query, and tail sequence even when every
+  selective flag is false. Capture covers forward matrix topology, not geometry
+  or backward execution.
 
 ### Changed
 
@@ -47,7 +64,8 @@
 - Prepared Torch cluster-tile state now rejects dual-cutoff vectors or
   distances during preparation instead of failing later during execution.
 - Prepared batched Torch cluster-tile state now reuses fixed partition and
-  padded-layout metadata while recomputing geometry-dependent data each call.
+  padded-layout metadata while recomputing geometry-dependent data for rebuilt
+  executions or systems.
 - Torch cluster-tile compact COO outputs are now trimmed to the actual pair
   count. Requested distances and vectors are returned with the topology, so
   callers no longer need to provide geometry buffers. If reusable buffers are
@@ -102,6 +120,8 @@
   precomputed from a reference cell or passed through
   `jax.lax.stop_gradient(k_vectors)`. Full
   `ewald_summation(k_vectors=...)` semantics are unchanged.
+- `neighbor_list` (Torch and JAX) now annotates `**kwargs` as `Any` instead of
+  `dict`, so type checkers no longer reject valid keyword options.
 
 ## 0.4.1 - 2026-08-03
 

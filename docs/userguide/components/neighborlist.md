@@ -713,14 +713,15 @@ def compiled_matrix(positions, cell):
 
 Use `prepare_cluster_tile` when repeated calls have the same atom count,
 single or batched partition, dtype, device, output format, and capacities.
-Preparation owns the fixed-capacity scratch and output buffers. Execution takes
-only the current positions, current cell, and prepared state:
+Preparation owns the fixed-capacity scratch and output buffers. Execution uses
+the current positions and cell through the matching direct API with the
+prepared state:
 
 ```python
 import torch
 
 from nvalchemiops.torch.neighbors import (
-    cluster_tile_neighbor_list_prepared,
+    cluster_tile_neighbor_list,
     prepare_cluster_tile,
 )
 
@@ -729,7 +730,6 @@ state = prepare_cluster_tile(
     cutoff,
     cell,
     format="matrix",
-    batch_ptr=batch_ptr,  # omit for one system
     max_neighbors=max_neighbors,
     max_tiles_per_group=max_tiles_per_group,
     return_distances=True,
@@ -738,12 +738,15 @@ state = prepare_cluster_tile(
 @torch.compile(fullgraph=True)
 def compiled_neighbors(current_positions, current_cell):
     # Capture state as a closure constant; do not pass it as a graph input.
-    return cluster_tile_neighbor_list_prepared(
+    return cluster_tile_neighbor_list(
         current_positions,
-        current_cell,
-        state,
+        cell=current_cell,
+        state=state,
     )
 ```
+
+For a batched state, pass `batch_ptr` to `prepare_cluster_tile` and execute it
+with `batch_cluster_tile_neighbor_list(..., cell_batch=current_cells, state=state)`.
 
 Prepared execution supports single and batched tile, matrix, dual-cutoff
 matrix topology, and nonselective exact COO output. Dual-cutoff prepared state
@@ -770,10 +773,75 @@ distinct storage.
 Preparation fixes the atom count, batch partition, shape, dtype, and device.
 For batches, it caches atom/system and padded-layout mappings derived only from
 that partition. Morton ordering, sorted coordinates, cell inverses, and group
-bounds are recomputed from the current positions and cells on every execution.
+bounds remain geometry-dependent and are recomputed when rebuild work runs. A
+mixed selective batch may still sort all atoms even though only selected
+systems' topology is rebuilt. An all-false eager call returns without rebuilding.
+Ordinary compiled selective calls use a fixed device-predicated execution
+sequence, so false flags preserve topology without promising skipped internal
+work.
 Execution rejects mismatches before launching kernels. Prepared pair callbacks,
-energies, forces, caller-provided buffers, and selective rebuilds are not
-supported.
+energies, forces, and caller-provided buffers are not supported.
+
+`ClusterTileState` is prepared configuration and reusable borrowed storage, not
+the neighbor-list result. Each call returns the same tuple as the corresponding
+unprepared method-specific function. With `state=`, the call ignores `cutoff`,
+`cutoff2`, `format`, `max_neighbors`, `max_pairs`, `fill_value`,
+`max_tiles_per_group`, `return_vectors`, `return_distances`, and `pair_fn`, even
+when they differ from the prepared configuration. The batched API also ignores
+`batch_ptr`. Change these settings by preparing another state. `positions` and
+`cell` or `cell_batch` remain required on every call. `rebuild_flags` remains
+active for selective states. Prepared pair callbacks and `pair_params` are not
+supported. Supplying explicit scratch, output, segment, or inverse-cell buffers
+raises `ValueError`, as does `return_state=True`.
+
+Set `selective=True` during preparation to rebuild matrix topology only for
+selected systems. Selective prepared execution supports single and batched
+matrix output, including dual cutoffs. It does not support tile or COO output,
+vectors, distances, or pair callbacks. Each execution requires a Boolean
+`rebuild_flags` tensor on the prepared device with one value per system. A true
+flag rebuilds that system. A false flag preserves its initialized neighbor
+matrix, counts, and shifts byte-for-byte; preserving a system before its first
+successful rebuild raises an error. Outside CUDA Graph capture, an all-false
+eager call preserves topology and returns before inverse, sorting, and build
+work. Ordinary compiled execution keeps flags on the device and always runs the
+inverse, Morton sort, build, query, and tail sequence; false flags preserve the
+corresponding topology. Consequently, an invalid current cell can fail during
+compiled execution even when every flag is false.
+
+An eager call marks every selected system uninitialized before rebuilding it
+and marks it initialized only after the complete call succeeds. If an eager
+rebuild fails, for example because the matrix capacity is too small, a later
+call cannot preserve any system selected by the failed call. Retry those
+systems with true flags after changing the geometry, or prepare a new state
+with sufficient capacity.
+
+##### CUDA Graph capture
+
+A warmed `torch.compile(fullgraph=True)` prepared callable can be captured with
+`torch.cuda.CUDAGraph` when it returns matrix topology. This supports single and
+batched state, one or two cutoffs, and selective or nonselective execution. For
+selective state, initialize every system before capture. Warm the compiled
+all-true path on a side stream and synchronize that stream before capture.
+
+Keep the prepared state object and the positions, cells, rebuild flags, output,
+and scratch tensors at the same addresses. Shapes, dtypes, devices, capacities,
+the batch partition, and the output format must remain fixed. Update positions,
+cells, and flags by copying into the existing tensors. Do not execute or replay
+the same mutable state concurrently.
+
+Selective replay accepts different flag values without recapture. The captured
+graph always records the complete inverse, Morton sort, metadata update,
+tile-build, query, and tail sequence; device-side flags decide which systems are
+updated on each replay. Therefore an all-false replay preserves topology but
+does not skip sorting or reduce the recorded launch sequence. Eager all-false
+calls return immediately. Ordinary compiled calls use the same fixed sequence
+without reading rebuild flags on the host.
+
+Capture is not supported for a direct eager prepared call, exact COO output,
+tile output, pair geometry, or backward execution. A device assertion during
+replay does not leave the prepared state recoverable. CUDA Graph-private
+temporary allocations may occur; the guarantee is stable prepared/public
+storage and no forbidden host synchronization during capture.
 
 #### Compiled JAX
 

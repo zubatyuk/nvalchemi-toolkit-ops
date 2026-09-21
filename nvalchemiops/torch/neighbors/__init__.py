@@ -20,6 +20,8 @@ This module provides the main entry point for PyTorch users of the neighbor list
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from nvalchemiops.neighbors.base_dispatch import (
@@ -91,7 +93,6 @@ from nvalchemiops.torch.neighbors.neighbor_utils import (
 )
 from nvalchemiops.torch.neighbors.prepared_cluster_tile import (
     ClusterTileState,
-    cluster_tile_neighbor_list_prepared,
     prepare_cluster_tile,
 )
 
@@ -109,7 +110,7 @@ def neighbor_list(
     return_neighbor_list: bool = False,
     method: str | None = None,
     wrap_positions: bool = True,
-    **kwargs: dict,
+    **kwargs: Any,
 ):
     """Compute neighbor list using the appropriate method based on the provided parameters.
 
@@ -178,7 +179,7 @@ def neighbor_list(
         wrapped (e.g. by a preceding integration step) to save two
         GPU kernel launches per call. Only applies to naive methods; cell list
         methods handle wrapping internally.
-    **kwargs : dict, optional
+    **kwargs : Any, optional
         Additional keyword arguments to pass to the method.
 
         max_neighbors : int, optional
@@ -629,7 +630,6 @@ __all__ = [
     "cluster_tile_neighbor_list",
     "ClusterTileState",
     "prepare_cluster_tile",
-    "cluster_tile_neighbor_list_prepared",
     "estimate_cell_list_sizes",
     # Batched algorithms
     "batch_cell_list",
