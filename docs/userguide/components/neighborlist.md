@@ -709,6 +709,72 @@ def compiled_matrix(positions, cell):
     )
 ```
 
+#### Prepared PyTorch execution
+
+Use `prepare_cluster_tile` when repeated calls have the same atom count,
+single or batched partition, dtype, device, output format, and capacities.
+Preparation owns the fixed-capacity scratch and output buffers. Execution takes
+only the current positions, current cell, and prepared state:
+
+```python
+import torch
+
+from nvalchemiops.torch.neighbors import (
+    cluster_tile_neighbor_list_prepared,
+    prepare_cluster_tile,
+)
+
+state = prepare_cluster_tile(
+    positions,
+    cutoff,
+    cell,
+    format="matrix",
+    batch_ptr=batch_ptr,  # omit for one system
+    max_neighbors=max_neighbors,
+    max_tiles_per_group=max_tiles_per_group,
+    return_distances=True,
+)
+
+@torch.compile(fullgraph=True)
+def compiled_neighbors(current_positions, current_cell):
+    # Capture state as a closure constant; do not pass it as a graph input.
+    return cluster_tile_neighbor_list_prepared(
+        current_positions,
+        current_cell,
+        state,
+    )
+```
+
+Prepared execution supports single and batched tile, matrix, dual-cutoff
+matrix topology, and nonselective exact COO output. Dual-cutoff prepared state
+does not support vectors or distances. Preparation rejects that combination
+before allocating storage. The other formats preserve the corresponding direct
+function's return tuple. Matrix topology and tile results borrow state-owned
+storage and a later call overwrites them. State-owned matrix geometry buffers
+are also borrowed, non-differentiable snapshots. When autograd reconstruction
+is needed, the function returns fresh differentiable geometry and writes
+matching detached values to those buffers; build losses from the returned
+geometry. Without reconstruction, returned matrix geometry aliases the state
+buffers. Exact COO topology, shifts, and requested geometry are newly sized on
+each call. Reusable exact-COO capacity buffers are available as
+`state.neighbor_vectors` and `state.neighbor_distances`; only the active prefix
+matching the returned pair count is defined, and it is a detached snapshot of
+the returned geometry.
+
+Preparation avoids reallocating the fixed scratch and output buffers, but
+execution may still allocate temporary tensors and exact-sized COO results. It
+is not an allocation-free API. Finish backward before reusing the same state,
+and copy every borrowed result that must survive that reuse. A second state owns
+distinct storage.
+
+Preparation fixes the atom count, batch partition, shape, dtype, and device.
+For batches, it caches atom/system and padded-layout mappings derived only from
+that partition. Morton ordering, sorted coordinates, cell inverses, and group
+bounds are recomputed from the current positions and cells on every execution.
+Execution rejects mismatches before launching kernels. Prepared pair callbacks,
+energies, forces, caller-provided buffers, and selective rebuilds are not
+supported.
+
 #### Compiled JAX
 
 JAX fixes array shapes while tracing a transformed or compiled function. When a
